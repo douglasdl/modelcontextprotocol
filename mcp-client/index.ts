@@ -1,204 +1,243 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import readline from "readline/promises";
-import dotenv from "dotenv";
+#!/usr/bin/env node
+import 'dotenv/config'
+import readline from 'node:readline'
+import { spawn } from 'node:child_process'
+import {
+  GoogleGenerativeAI,
+  FunctionDeclaration,
+  SchemaType,
+} from '@google/generative-ai'
 
-dotenv.config();
+/* =====================================================
+ * Types
+ * ===================================================== */
 
-// =====================
-// ENV
-// =====================
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-if (!GEMINI_API_KEY) {
-  throw new Error("GEMINI_API_KEY is not set");
+interface MCPTool {
+  name: string
+  description?: string
+  inputSchema?: unknown
 }
 
-const GEMINI_MODEL = "gemini-1.5-pro";
+interface MCPRequest {
+  jsonrpc: '2.0'
+  id: number
+  method: string
+  params?: any
+}
 
-// =====================
-// MCP Client
-// =====================
+interface MCPResponse {
+  jsonrpc: '2.0'
+  id: number
+  result?: any
+  error?: any
+}
+
+/* =====================================================
+ * MCP Client
+ * ===================================================== */
+
 class MCPClient {
-  private mcp: Client;
-  private gemini: GoogleGenerativeAI;
-  private transport: StdioClientTransport | null = null;
-  private tools: any[] = [];
+  private child
+  private buffer = ''
+  private id = 0
+  private pending = new Map<number, (res: MCPResponse) => void>()
 
-  constructor() {
-    this.gemini = new GoogleGenerativeAI(GEMINI_API_KEY!);
-    this.mcp = new Client({
-      name: "mcp-client-cli",
-      version: "1.0.0",
-    });
+  private genAI
+  private model
+  private tools: FunctionDeclaration[] = []
+
+  constructor(serverPath: string) {
+    /* ---- Start MCP Server ---- */
+    this.child = spawn('node', [serverPath], {
+      stdio: ['pipe', 'pipe', 'inherit'],
+    })
+
+    this.child.stdout.on('data', (data) => this.onData(data.toString()))
+
+    /* ---- Gemini ---- */
+    if (!process.env.GEMINI_API_KEY) {
+      throw new Error('GEMINI_API_KEY not set')
+    }
+
+    this.genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
+    this.model = this.genAI.getGenerativeModel({
+      model: 'gemini-2.5-flash',
+    })
   }
 
-  async connectToServer(serverScriptPath: string) {
-    try {
-      const isJs = serverScriptPath.endsWith(".js");
-      const isPy = serverScriptPath.endsWith(".py");
+  /* =================================================== */
 
-      if (!isJs && !isPy) {
-        throw new Error("Server script must be a .js or .py file");
+  private onData(chunk: string) {
+    this.buffer += chunk
+    const lines = this.buffer.split('\n')
+    this.buffer = lines.pop() ?? ''
+
+    for (const line of lines) {
+      if (!line.trim()) continue
+      const msg = JSON.parse(line) as MCPResponse
+      const resolver = this.pending.get(msg.id)
+      if (resolver) {
+        resolver(msg)
+        this.pending.delete(msg.id)
       }
-
-      const command = isPy
-        ? process.platform === "win32"
-          ? "python"
-          : "python3"
-        : process.execPath;
-
-      this.transport = new StdioClientTransport({
-        command,
-        args: [serverScriptPath],
-      });
-
-      await this.mcp.connect(this.transport);
-
-      const toolsResult = await this.mcp.listTools();
-
-      // Convert MCP tools → Gemini function declarations
-      this.tools = toolsResult.tools.map((tool) => ({
-        name: tool.name,
-        description: tool.description,
-        parameters: tool.inputSchema,
-      }));
-
-      console.log(
-        "Connected to server with tools:",
-        this.tools.map((t) => t.name),
-      );
-    } catch (e) {
-      console.error("Failed to connect to MCP server:", e);
-      throw e;
     }
   }
 
+  private request(method: string, params?: any): Promise<MCPResponse> {
+    const id = ++this.id
+    const payload: MCPRequest = {
+      jsonrpc: '2.0',
+      id,
+      method,
+      params,
+    }
+
+    return new Promise((resolve) => {
+      this.pending.set(id, resolve)
+      this.child.stdin.write(JSON.stringify(payload) + '\n')
+    })
+  }
+
+  /* =================================================== */
+
+  async init() {
+    const res = await this.request('tools/list')
+
+    const tools: MCPTool[] = res.result.tools
+
+    console.log(
+      'Connected to server with tools:',
+      tools.map((t) => t.name)
+    )
+
+    this.tools = tools.map((tool) => this.toGeminiTool(tool))
+  }
+
+  /* ===================================================
+   * MCP → Gemini Schema Adapter (SAFE)
+   * =================================================== */
+
+  private toGeminiTool(tool: MCPTool): FunctionDeclaration {
+    switch (tool.name) {
+      case 'get_forecast':
+        return {
+          name: 'get_forecast',
+          description: 'Get weather forecast for a city',
+          parameters: {
+            type: SchemaType.OBJECT,
+            properties: {
+              city: {
+                type: SchemaType.STRING,
+              },
+            },
+            required: ['city'],
+          },
+        }
+
+      case 'get_alerts':
+        return {
+          name: 'get_alerts',
+          description: 'Get weather alerts for a region',
+          parameters: {
+            type: SchemaType.OBJECT,
+            properties: {
+              region: {
+                type: SchemaType.STRING,
+              },
+            },
+            required: ['region'],
+          },
+        }
+
+      default:
+        return {
+          name: tool.name,
+          description: tool.description ?? '',
+          parameters: {
+            type: SchemaType.OBJECT,
+            properties: {},
+          },
+        }
+    }
+  }
+
+  /* =================================================== */
+
   async processQuery(query: string) {
-    const model = this.gemini.getGenerativeModel({
-      model: GEMINI_MODEL,
-      tools: [
+    const result = await this.model.generateContent({
+      contents: [{ role: 'user', parts: [{ text: query }] }],
+      tools: [{ functionDeclarations: this.tools }],
+    })
+
+    const call =
+      result.response.candidates?.[0]?.content?.parts?.find(
+        (p: any) => p.functionCall
+      )?.functionCall
+
+    if (!call) {
+      console.log('\n🤖', result.response.text())
+      return
+    }
+
+    const toolResult = await this.request('tools/call', {
+      name: call.name,
+      arguments: call.args,
+    })
+
+    const followUp = await this.model.generateContent({
+      contents: [
+        { role: 'user', parts: [{ text: query }] },
         {
-          functionDeclarations: this.tools,
-        },
-      ],
-    });
-
-    let messages: any[] = [
-      {
-        role: "user",
-        parts: [{ text: query }],
-      },
-    ];
-
-    const finalText: string[] = [];
-
-    // First call
-    let result = await model.generateContent({
-      contents: messages,
-    });
-
-    let response = result.response;
-
-    while (true) {
-      const candidate = response.candidates?.[0];
-      const part = candidate?.content?.parts?.[0];
-
-      // Normal text response
-      if (part?.text) {
-        finalText.push(part.text);
-        break;
-      }
-
-      // Tool call (functionCall)
-      if (part?.functionCall) {
-        const { name, args } = part.functionCall;
-
-        const toolResult = await this.mcp.callTool({
-          name,
-          arguments: args as Record<string, unknown>,
-        });
-
-        // Feed tool result back to Gemini
-        messages.push({
-          role: "model",
+          role: 'tool',
           parts: [
             {
               functionResponse: {
-                name,
-                response: {
-                  content: toolResult.content,
-                },
+                name: call.name,
+                response: toolResult.result,
               },
             },
           ],
-        });
+        },
+      ],
+    })
 
-        result = await model.generateContent({
-          contents: messages,
-        });
-
-        response = result.response;
-        continue;
-      }
-
-      // Fallback
-      finalText.push("No response from Gemini.");
-      break;
-    }
-
-    return finalText.join("\n");
+    console.log('\n🌤️', followUp.response.text())
   }
+
+  /* =================================================== */
 
   async chatLoop() {
     const rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
-    });
+    })
 
-    try {
-      console.log("\nMCP Client Started (Gemini)!");
-      console.log("Type your queries or 'quit' to exit.");
+    console.log('\nMCP Client Started (Gemini)!\nType your queries or "quit".\n')
 
-      while (true) {
-        const message = await rl.question("\nQuery: ");
-        if (message.toLowerCase() === "quit") break;
-
-        const response = await this.processQuery(message);
-        console.log("\n" + response);
+    for await (const line of rl) {
+      if (line.trim().toLowerCase() === 'quit') {
+        rl.close()
+        process.exit(0)
       }
-    } finally {
-      rl.close();
+      await this.processQuery(line)
     }
   }
-
-  async cleanup() {
-    await this.mcp.close();
-  }
 }
 
-// =====================
-// Main
-// =====================
+/* =====================================================
+ * Main
+ * ===================================================== */
+
 async function main() {
-  if (process.argv.length < 3) {
-    console.log("Usage: node build/index.js <path_to_server_script>");
-    return;
+  const serverPath = process.argv[2]
+  if (!serverPath) {
+    console.error('Usage: node index.js <mcp-server.js>')
+    process.exit(1)
   }
 
-  const mcpClient = new MCPClient();
-
-  try {
-    await mcpClient.connectToServer(process.argv[2]);
-    await mcpClient.chatLoop();
-  } catch (e) {
-    console.error("Error:", e);
-    await mcpClient.cleanup();
-    process.exit(1);
-  } finally {
-    await mcpClient.cleanup();
-    process.exit(0);
-  }
+  const client = new MCPClient(serverPath)
+  await client.init()
+  await client.chatLoop()
 }
 
-main();
+main()
