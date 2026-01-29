@@ -14,7 +14,7 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.71.2",
+    "@google/generative-ai": "^0.24.1",
     "@modelcontextprotocol/sdk": "^1.25.3",
     "dotenv": "^17.2.3",
     "openai": "^6.17.0"
